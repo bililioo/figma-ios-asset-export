@@ -1,0 +1,12 @@
+{
+  "fileKey": "FILE_KEY",
+  "outDir": "/tmp/figma-ios-asset-export-test/plain",
+  "format": "pdf",
+  "items": [
+    {
+      "asset": "sample_logo",
+      "nodeId": "2:300",
+      "figmaName": "Logo"
+    }
+  ]
+}

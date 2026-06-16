@@ -24,9 +24,12 @@ This skill keeps the export decision explicit and repeatable:
 
 ```text
 .
-├── SKILL.md
-├── agents/openai.yaml
-└── scripts/export_figma_ios_assets.mjs
+├── SKILL.md                              # compatibility copy
+├── agents/openai.yaml                    # compatibility copy
+├── scripts/export_figma_ios_assets.mjs   # compatibility copy
+├── skill/figma-ios-asset-export/         # package-ready skill folder
+├── tests/fixtures/
+└── github-workflows/test.yml.example
 ```
 
 ## Prerequisites
@@ -38,9 +41,10 @@ Do not commit real Figma tokens. Provide a token with one of:
 
 ```sh
 export FIGMA_TOKEN_FILE=/path/to/figma-token.txt
-# or
-export FIGMA_TOKEN=...
 ```
+
+Environment token variables are also supported, but `FIGMA_TOKEN_FILE` is safer
+because it avoids shell history.
 
 ## Mapping Example
 
@@ -60,13 +64,21 @@ export FIGMA_TOKEN=...
 Export PNG `@2x` and `@3x` Xcode imagesets:
 
 ```sh
-node scripts/export_figma_ios_assets.mjs --mapping /tmp/figma-assets.json
+node skill/figma-ios-asset-export/scripts/export_figma_ios_assets.mjs --mapping /tmp/figma-assets.json
+```
+
+Validate a mapping without a token or network:
+
+```sh
+node skill/figma-ios-asset-export/scripts/export_figma_ios_assets.mjs \
+  --mapping tests/fixtures/imageset-mapping.json \
+  --dry-run
 ```
 
 Export plain PNG files:
 
 ```sh
-node scripts/export_figma_ios_assets.mjs \
+node skill/figma-ios-asset-export/scripts/export_figma_ios_assets.mjs \
   --figma-url "https://www.figma.com/design/FILE_KEY/FileName" \
   --mapping /tmp/figma-assets.json \
   --out-dir /tmp/figma-pngs
@@ -75,7 +87,7 @@ node scripts/export_figma_ios_assets.mjs \
 Export vector PDF assets:
 
 ```sh
-node scripts/export_figma_ios_assets.mjs \
+node skill/figma-ios-asset-export/scripts/export_figma_ios_assets.mjs \
   --mapping /tmp/figma-assets.json \
   --format pdf
 ```
@@ -91,12 +103,42 @@ find PATH_TO_ASSET_ROOT -name Contents.json -print0 | xargs -0 python3 -m json.t
 
 Then build with the target project's approved Xcode or harness command.
 
+The repository includes token-free dry-run fixtures:
+
+```sh
+rm -rf /tmp/figma-ios-asset-export-test
+node skill/figma-ios-asset-export/scripts/export_figma_ios_assets.mjs \
+  --mapping tests/fixtures/imageset-mapping.json \
+  --dry-run
+find /tmp/figma-ios-asset-export-test -name Contents.json -print0 | xargs -0 python3 -m json.tool >/dev/null
+
+node skill/figma-ios-asset-export/scripts/export_figma_ios_assets.mjs \
+  --mapping tests/fixtures/plain-pdf-mapping.json \
+  --dry-run
+```
+
+`github-workflows/test.yml.example` can be copied to `.github/workflows/test.yml`
+when your GitHub token has `workflow` scope.
+
 ## Safety
 
 - Never store tokens in `SKILL.md`, mapping files, or committed scripts.
+- Prefer `--token-file` or `FIGMA_TOKEN_FILE` over `--token` so tokens do not
+  land in shell history.
+- `--dry-run` never calls Figma and does not require a token.
 - Treat Figma artwork as source material owned by the design file owner.
 - If Figma access fails, report the blocker instead of silently substituting
   approximate native artwork.
+
+## Release
+
+Package the skill with a compatible skill packager:
+
+```sh
+python3 path/to/skill-creator/scripts/package_skill.py skill/figma-ios-asset-export dist
+```
+
+Attach `dist/figma-ios-asset-export.skill` to a GitHub Release.
 
 ## License
 

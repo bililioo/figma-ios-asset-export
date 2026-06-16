@@ -5,3 +5,5 @@ node_modules/
 figma-token*.txt
 *.xcresult
 DerivedData/
+dist/
+*.skill

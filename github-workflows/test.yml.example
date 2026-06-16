@@ -1,0 +1,25 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Node version
+        run: node --version
+      - name: Dry-run PNG imageset export
+        run: |
+          rm -rf /tmp/figma-ios-asset-export-test
+          node skill/figma-ios-asset-export/scripts/export_figma_ios_assets.mjs \
+            --mapping tests/fixtures/imageset-mapping.json \
+            --dry-run
+          find /tmp/figma-ios-asset-export-test -name Contents.json -print0 | xargs -0 python3 -m json.tool >/dev/null
+      - name: Dry-run PDF export
+        run: |
+          node skill/figma-ios-asset-export/scripts/export_figma_ios_assets.mjs \
+            --mapping tests/fixtures/plain-pdf-mapping.json \
+            --dry-run

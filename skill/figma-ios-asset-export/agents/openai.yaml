@@ -1,0 +1,4 @@
+interface:
+  display_name: "Figma iOS Asset Export"
+  short_description: "Export Figma nodes to iOS assets"
+  default_prompt: "Use $figma-ios-asset-export to export Figma nodes as @2x/@3x PNG imagesets or vector PDFs."

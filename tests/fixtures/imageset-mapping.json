@@ -1,0 +1,16 @@
+{
+  "figmaUrl": "https://www.figma.com/design/FILE_KEY/FileName?node-id=1-607",
+  "assetRoot": "/tmp/figma-ios-asset-export-test/Assets.xcassets/FigmaSlices",
+  "items": [
+    {
+      "asset": "sample_icon_settings",
+      "nodeId": "1-202",
+      "figmaName": "Settings icon"
+    },
+    {
+      "asset": "sample_empty_state",
+      "nodeId": "1:476",
+      "figmaName": "Empty state illustration"
+    }
+  ]
+}
