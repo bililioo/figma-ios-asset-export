@@ -110,7 +110,6 @@ rm -rf /tmp/figma-ios-asset-export-test
 node skill/figma-ios-asset-export/scripts/export_figma_ios_assets.mjs \
   --mapping tests/fixtures/imageset-mapping.json \
   --dry-run
-find /tmp/figma-ios-asset-export-test -name Contents.json -print0 | xargs -0 python3 -m json.tool >/dev/null
 
 node skill/figma-ios-asset-export/scripts/export_figma_ios_assets.mjs \
   --mapping tests/fixtures/plain-pdf-mapping.json \
@@ -125,7 +124,7 @@ when your GitHub token has `workflow` scope.
 - Never store tokens in `SKILL.md`, mapping files, or committed scripts.
 - Prefer `--token-file` or `FIGMA_TOKEN_FILE` over `--token` so tokens do not
   land in shell history.
-- `--dry-run` never calls Figma and does not require a token.
+- `--dry-run` never calls Figma, does not require a token, and does not write output files.
 - Treat Figma artwork as source material owned by the design file owner.
 - If Figma access fails, report the blocker instead of silently substituting
   approximate native artwork.

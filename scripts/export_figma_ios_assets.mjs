@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const DEFAULT_SCALES = [2, 3];
+const DEFAULT_RETRIES = 2;
+const DEFAULT_RETRY_DELAY_MS = 500;
 const TOKEN_ENV_NAMES = [
   'FIGMA_TOKEN',
   'FIGMA_ACCESS_TOKEN',
@@ -38,8 +40,10 @@ Options:
   --token TOKEN          Figma REST API token. Avoid this in shell history when possible.
   --token-file FILE      File containing a Figma token. Can also be set with FIGMA_TOKEN_FILE.
   --batch-size N         Node ids per REST request. Default: 50.
+  --retries N            Retries for Figma/API downloads on 429/5xx/network failures. Default: 2.
+  --retry-delay-ms N     Initial retry delay in milliseconds. Default: 500.
   --use-absolute-bounds  Pass use_absolute_bounds=true to Figma.
-  --dry-run              Validate mapping and write Contents.json only. Does not require a token or network.
+  --dry-run              Validate mapping and preview planned outputs. Does not require a token or network.
 `);
 }
 
@@ -48,6 +52,8 @@ function parseArgs(argv) {
     format: undefined,
     scales: undefined,
     batchSize: 50,
+    retries: DEFAULT_RETRIES,
+    retryDelayMs: DEFAULT_RETRY_DELAY_MS,
     useAbsoluteBounds: false,
   };
 
@@ -84,6 +90,14 @@ function parseArgs(argv) {
   out.batchSize = Number(out.batchSize);
   if (!Number.isInteger(out.batchSize) || out.batchSize <= 0) {
     throw new Error('Invalid --batch-size');
+  }
+  out.retries = Number(out.retries);
+  if (!Number.isInteger(out.retries) || out.retries < 0) {
+    throw new Error('Invalid --retries');
+  }
+  out.retryDelayMs = Number(out.retryDelayMs);
+  if (!Number.isInteger(out.retryDelayMs) || out.retryDelayMs < 0) {
+    throw new Error('Invalid --retry-delay-ms');
   }
   return out;
 }
@@ -156,16 +170,44 @@ function chunk(items, size) {
   return chunks;
 }
 
-async function figmaImagesRequest({ fileKey, ids, format, scale, token, useAbsoluteBounds }) {
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function shouldRetry(status) {
+  return status === 429 || status >= 500;
+}
+
+async function fetchWithRetry(url, options, label, { retries, retryDelayMs }) {
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      const response = await fetch(url, options);
+      if (!shouldRetry(response.status) || attempt === retries) return response;
+      lastError = new Error(`${label} failed with HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+      if (attempt === retries) throw error;
+    }
+    const delay = retryDelayMs * (2 ** attempt);
+    if (delay > 0) await sleep(delay);
+  }
+  throw lastError;
+}
+
+async function figmaImagesRequest({ fileKey, ids, format, scale, token, useAbsoluteBounds, retries, retryDelayMs }) {
   const url = new URL(`https://api.figma.com/v1/images/${fileKey}`);
   url.searchParams.set('ids', ids.join(','));
   url.searchParams.set('format', format);
   if (format === 'png') url.searchParams.set('scale', String(scale));
   if (useAbsoluteBounds) url.searchParams.set('use_absolute_bounds', 'true');
 
-  const response = await fetch(url, {
-    headers: { 'X-Figma-Token': token },
-  });
+  const response = await fetchWithRetry(
+    url,
+    { headers: { 'X-Figma-Token': token } },
+    `Figma images API for ${ids.join(',')}`,
+    { retries, retryDelayMs },
+  );
   let body;
   try {
     body = await response.json();
@@ -189,8 +231,8 @@ async function getImageUrls(options, ids) {
   return all;
 }
 
-async function downloadBytes(url, label) {
-  const response = await fetch(url);
+async function downloadBytes(url, label, { retries, retryDelayMs }) {
+  const response = await fetchWithRetry(url, undefined, `Download ${label}`, { retries, retryDelayMs });
   if (!response.ok) throw new Error(`Download failed for ${label}: HTTP ${response.status}`);
   return Buffer.from(await response.arrayBuffer());
 }
@@ -208,10 +250,33 @@ function writeJson(file, value) {
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-function resetImageset(imageset) {
-  fs.mkdirSync(imageset, { recursive: true });
-  for (const file of fs.readdirSync(imageset)) {
-    if (/\.(png|pdf)$/i.test(file)) fs.rmSync(path.join(imageset, file));
+function tmpPathFor(target) {
+  const parent = path.dirname(target);
+  const name = path.basename(target);
+  return path.join(parent, `.${name}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+}
+
+function replaceDirectory(from, to) {
+  const backup = fs.existsSync(to) ? tmpPathFor(to) : undefined;
+  if (backup) fs.renameSync(to, backup);
+  try {
+    fs.renameSync(from, to);
+    if (backup) fs.rmSync(backup, { recursive: true, force: true });
+  } catch (error) {
+    if (fs.existsSync(to)) fs.rmSync(to, { recursive: true, force: true });
+    if (backup) fs.renameSync(backup, to);
+    throw error;
+  }
+}
+
+function replaceFile(from, to) {
+  fs.mkdirSync(path.dirname(to), { recursive: true });
+  fs.renameSync(from, to);
+}
+
+function cleanupStagedPaths(paths) {
+  for (const target of paths.reverse()) {
+    fs.rmSync(target, { recursive: true, force: true });
   }
 }
 
@@ -242,9 +307,28 @@ function outputPathFor({ assetRoot, outDir, item, format, scale }) {
     return { imageset, file: path.join(imageset, filename), asset };
   }
 
-  fs.mkdirSync(outDir, { recursive: true });
   const filename = format === 'png' ? `${asset}@${scale}x.png` : `${asset}.pdf`;
   return { file: path.join(outDir, filename), asset };
+}
+
+function outputTargetsFor({ assetRoot, outDir, item, format, scales }) {
+  const scalesForItem = format === 'png' ? scales : [undefined];
+  return scalesForItem.map(scale => outputPathFor({ assetRoot, outDir, item, format, scale }));
+}
+
+function assertUniqueOutputTargets({ items, assetRoot, outDir, format, scales }) {
+  const seen = new Map();
+  for (const item of items) {
+    for (const target of outputTargetsFor({ assetRoot, outDir, item, format, scales })) {
+      const previous = seen.get(target.file);
+      if (previous) {
+        throw new Error(
+          `Duplicate output target ${target.file} for node ${item.nodeId}; already used by node ${previous.nodeId}. Use unique asset names.`,
+        );
+      }
+      seen.set(target.file, item);
+    }
+  }
 }
 
 function validateItems(items, assetRoot) {
@@ -257,7 +341,31 @@ function validateItems(items, assetRoot) {
   });
 }
 
-async function exportPng({ items, token, fileKey, assetRoot, outDir, scales, batchSize, useAbsoluteBounds }) {
+function assertAllPngUrls({ items, urlsByScale, scales }) {
+  const missing = [];
+  for (const item of items) {
+    const asset = safeFileStem(item);
+    for (const scale of scales) {
+      if (!urlsByScale.get(scale)[item.nodeId]) missing.push(`${asset} (${item.nodeId}) @${scale}x`);
+    }
+  }
+  if (missing.length) {
+    throw new Error(`Figma returned no PNG URL for ${missing.length} export(s): ${missing.join(', ')}`);
+  }
+}
+
+function assertAllPdfUrls({ items, urls }) {
+  const missing = [];
+  for (const item of items) {
+    const asset = safeFileStem(item);
+    if (!urls[item.nodeId]) missing.push(`${asset} (${item.nodeId})`);
+  }
+  if (missing.length) {
+    throw new Error(`Figma returned no PDF URL for ${missing.length} export(s): ${missing.join(', ')}`);
+  }
+}
+
+async function exportPng({ items, token, fileKey, assetRoot, outDir, scales, batchSize, useAbsoluteBounds, retries, retryDelayMs }) {
   const ids = items.map(item => item.nodeId);
   const urlsByScale = new Map();
   for (const scale of scales) {
@@ -268,33 +376,52 @@ async function exportPng({ items, token, fileKey, assetRoot, outDir, scales, bat
       token,
       batchSize,
       useAbsoluteBounds,
+      retries,
+      retryDelayMs,
     }, ids));
   }
+  assertAllPngUrls({ items, urlsByScale, scales });
 
   let count = 0;
-  for (const item of items) {
-    const asset = safeFileStem(item);
-    let imageset;
-    if (assetRoot) {
-      imageset = path.join(assetRoot, `${asset}.imageset`);
-      resetImageset(imageset);
+  const stagedWrites = [];
+  const stagedPaths = [];
+  try {
+    for (const item of items) {
+      const asset = safeFileStem(item);
+      const stagedImageset = assetRoot ? tmpPathFor(path.join(assetRoot, `${asset}.imageset`)) : undefined;
+      if (assetRoot) {
+        fs.mkdirSync(stagedImageset, { recursive: true });
+        stagedPaths.push(stagedImageset);
+      }
+
+      for (const scale of scales) {
+        const url = urlsByScale.get(scale)[item.nodeId];
+        const { file } = outputPathFor({ assetRoot, outDir, item, format: 'png', scale });
+        const stagedFile = assetRoot ? path.join(stagedImageset, path.basename(file)) : tmpPathFor(file);
+        if (!assetRoot) stagedPaths.push(stagedFile);
+        fs.mkdirSync(path.dirname(stagedFile), { recursive: true });
+        const bytes = await downloadBytes(url, `${asset}@${scale}x`, { retries, retryDelayMs });
+        fs.writeFileSync(stagedFile, bytes);
+        const dimensions = pngDimensions(bytes);
+        const suffix = dimensions ? ` ${dimensions.width}x${dimensions.height}` : '';
+        console.log(`[${asset}] saved ${file}${suffix}`);
+        if (!assetRoot) stagedWrites.push({ stagedFile, file });
+        count += 1;
+      }
+
+      if (assetRoot) {
+        const finalImageset = path.join(assetRoot, `${asset}.imageset`);
+        writePngContents(stagedImageset, asset, scales);
+        stagedWrites.push({ stagedDir: stagedImageset, dir: finalImageset });
+      }
     }
-
-    for (const scale of scales) {
-      const url = urlsByScale.get(scale)[item.nodeId];
-      if (!url) throw new Error(`[${asset}] Figma returned no PNG URL for ${item.nodeId} @${scale}x`);
-
-      const { file } = outputPathFor({ assetRoot, outDir, item, format: 'png', scale });
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      const bytes = await downloadBytes(url, `${asset}@${scale}x`);
-      fs.writeFileSync(file, bytes);
-      const dimensions = pngDimensions(bytes);
-      const suffix = dimensions ? ` ${dimensions.width}x${dimensions.height}` : '';
-      console.log(`[${asset}] saved ${file}${suffix}`);
-      count += 1;
-    }
-
-    if (assetRoot) writePngContents(imageset, asset, scales);
+  } catch (error) {
+    cleanupStagedPaths(stagedPaths);
+    throw error;
+  }
+  for (const write of stagedWrites) {
+    if (write.stagedDir) replaceDirectory(write.stagedDir, write.dir);
+    else replaceFile(write.stagedFile, write.file);
   }
   return count;
 }
@@ -305,19 +432,16 @@ function dryRunPng({ items, assetRoot, outDir, scales }) {
     const asset = safeFileStem(item);
     if (assetRoot) {
       const imageset = path.join(assetRoot, `${asset}.imageset`);
-      resetImageset(imageset);
-      writePngContents(imageset, asset, scales);
-      console.log(`[dry-run:${asset}] wrote ${path.join(imageset, 'Contents.json')}`);
+      console.log(`[dry-run:${asset}] would write ${path.join(imageset, 'Contents.json')} and ${scales.map(scale => `${asset}@${scale}x.png`).join(', ')}`);
     } else {
-      fs.mkdirSync(outDir, { recursive: true });
-      console.log(`[dry-run:${asset}] would write ${scales.map(scale => `${asset}@${scale}x.png`).join(', ')}`);
+      console.log(`[dry-run:${asset}] would write ${scales.map(scale => `${asset}@${scale}x.png`).join(', ')} to ${outDir}`);
     }
     count += scales.length;
   }
   return count;
 }
 
-async function exportPdf({ items, token, fileKey, assetRoot, outDir, batchSize, useAbsoluteBounds }) {
+async function exportPdf({ items, token, fileKey, assetRoot, outDir, batchSize, useAbsoluteBounds, retries, retryDelayMs }) {
   const ids = items.map(item => item.nodeId);
   const urls = await getImageUrls({
     fileKey,
@@ -325,25 +449,45 @@ async function exportPdf({ items, token, fileKey, assetRoot, outDir, batchSize, 
     token,
     batchSize,
     useAbsoluteBounds,
+    retries,
+    retryDelayMs,
   }, ids);
+  assertAllPdfUrls({ items, urls });
 
   let count = 0;
-  for (const item of items) {
-    const asset = safeFileStem(item);
-    const url = urls[item.nodeId];
-    if (!url) throw new Error(`[${asset}] Figma returned no PDF URL for ${item.nodeId}`);
+  const stagedWrites = [];
+  const stagedPaths = [];
+  try {
+    for (const item of items) {
+      const asset = safeFileStem(item);
+      const url = urls[item.nodeId];
 
-    const { imageset, file } = outputPathFor({ assetRoot, outDir, item, format: 'pdf' });
-    if (assetRoot) resetImageset(imageset);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    const bytes = await downloadBytes(url, `${asset}.pdf`);
-    if (bytes.subarray(0, 4).toString('utf8') !== '%PDF') {
-      throw new Error(`[${asset}] Downloaded PDF did not start with %PDF`);
+      const { imageset, file } = outputPathFor({ assetRoot, outDir, item, format: 'pdf' });
+      const stagedImageset = assetRoot ? tmpPathFor(imageset) : undefined;
+      const stagedFile = assetRoot ? path.join(stagedImageset, path.basename(file)) : tmpPathFor(file);
+      stagedPaths.push(assetRoot ? stagedImageset : stagedFile);
+      fs.mkdirSync(path.dirname(stagedFile), { recursive: true });
+      const bytes = await downloadBytes(url, `${asset}.pdf`, { retries, retryDelayMs });
+      if (bytes.subarray(0, 4).toString('utf8') !== '%PDF') {
+        throw new Error(`[${asset}] Downloaded PDF did not start with %PDF`);
+      }
+      fs.writeFileSync(stagedFile, bytes);
+      if (assetRoot) {
+        writePdfContents(stagedImageset, asset);
+        stagedWrites.push({ stagedDir: stagedImageset, dir: imageset });
+      } else {
+        stagedWrites.push({ stagedFile, file });
+      }
+      console.log(`[${asset}] saved ${file} ${bytes.length} bytes`);
+      count += 1;
     }
-    fs.writeFileSync(file, bytes);
-    if (assetRoot) writePdfContents(imageset, asset);
-    console.log(`[${asset}] saved ${file} ${bytes.length} bytes`);
-    count += 1;
+  } catch (error) {
+    cleanupStagedPaths(stagedPaths);
+    throw error;
+  }
+  for (const write of stagedWrites) {
+    if (write.stagedDir) replaceDirectory(write.stagedDir, write.dir);
+    else replaceFile(write.stagedFile, write.file);
   }
   return count;
 }
@@ -354,12 +498,9 @@ function dryRunPdf({ items, assetRoot, outDir }) {
     const asset = safeFileStem(item);
     if (assetRoot) {
       const imageset = path.join(assetRoot, `${asset}.imageset`);
-      resetImageset(imageset);
-      writePdfContents(imageset, asset);
-      console.log(`[dry-run:${asset}] wrote ${path.join(imageset, 'Contents.json')}`);
+      console.log(`[dry-run:${asset}] would write ${path.join(imageset, 'Contents.json')} and ${asset}.pdf`);
     } else {
-      fs.mkdirSync(outDir, { recursive: true });
-      console.log(`[dry-run:${asset}] would write ${asset}.pdf`);
+      console.log(`[dry-run:${asset}] would write ${asset}.pdf to ${outDir}`);
     }
     count += 1;
   }
@@ -384,6 +525,7 @@ async function main() {
   if (format === 'png') assertScales(scales);
 
   const items = validateItems(mapping.items, assetRoot);
+  assertUniqueOutputTargets({ items, assetRoot, outDir, format, scales });
 
   if (args.dryRun) {
     const dryCount = format === 'png'
@@ -403,6 +545,8 @@ async function main() {
     outDir,
     scales,
     batchSize: args.batchSize,
+    retries: args.retries,
+    retryDelayMs: args.retryDelayMs,
     useAbsoluteBounds: args.useAbsoluteBounds || Boolean(mapping.useAbsoluteBounds),
   };
   const count = format === 'png' ? await exportPng(common) : await exportPdf(common);

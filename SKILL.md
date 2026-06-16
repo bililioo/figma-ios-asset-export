@@ -9,6 +9,8 @@ description: Export real Figma design nodes through the Figma REST images API in
 
 Use `scripts/export_figma_ios_assets.mjs` for repeatable exports. It calls the Figma REST `GET /v1/images/:key` endpoint and downloads the returned asset URLs. Prefer PNG `@2x` and `@3x` for ordinary iOS bitmap assets; use PDF only when the user asks for vector PDF or when the asset should preserve vector representation.
 
+For batch exports, the script validates the full mapping before writing final outputs. It rejects duplicate output filenames, verifies that Figma returned URLs for every requested node and scale, stages downloads in temporary paths, and replaces final files only after each asset is complete. Figma API requests and image downloads retry transient `429` and `5xx` failures by default.
+
 ## Asset-First Rule
 
 When a Figma link is part of an iOS implementation or visual matching task, treat the Figma file as the source of truth for custom imagery. Before replacing a visual node with native drawing, CALayers, SwiftUI shapes, UIKit views, or SF Symbols, decide whether it is an exportable asset.
@@ -68,6 +70,8 @@ Fields:
 - `format`: Optional mapping default, `png` or `pdf`. Prefer the default `png`.
 - `scales`: Optional PNG scale list. Default is `[2, 3]`.
 
+Each item must resolve to a unique output filename. Do not reuse the same `asset` name for different nodes in the same mapping; the script fails before writing if two items would target the same PNG, PDF, or `.imageset` output.
+
 For a single pasted node URL, still create a mapping instead of manually downloading one-off files. This keeps names, scales, and `.imageset` metadata repeatable.
 
 ## Commands
@@ -94,6 +98,23 @@ For vector PDF assets:
 node ~/.codex/skills/figma-ios-asset-export/scripts/export_figma_ios_assets.mjs \
   --mapping /tmp/figma-assets.json \
   --format pdf
+```
+
+To validate a batch mapping without a token, network, or filesystem writes:
+
+```sh
+node ~/.codex/skills/figma-ios-asset-export/scripts/export_figma_ios_assets.mjs \
+  --mapping /tmp/figma-assets.json \
+  --dry-run
+```
+
+For large batches or unstable networks, tune retry behavior:
+
+```sh
+node ~/.codex/skills/figma-ios-asset-export/scripts/export_figma_ios_assets.mjs \
+  --mapping /tmp/figma-assets.json \
+  --retries 4 \
+  --retry-delay-ms 750
 ```
 
 ## Verification
